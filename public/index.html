@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Mediasoup Streaming</title>
+    <script src="https://cdn.socket.io/4.5.1/socket.io.min.js"></script>
+  </head>
+  <body>
+    <video id="localVideo" autoplay muted></video>
+    <video id="remoteVideo" autoplay></video>
+    <script>
+      const socket = io("http://localhost:3000");
+      const localVideo = document.getElementById("localVideo");
+      const remoteVideo = document.getElementById("remoteVideo");
+      let transport;
+      let rtpCapabilities;
+
+      async function start() {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true,
+        });
+        localVideo.srcObject = stream;
+        socket.emit("getRouterRtpCapabilities", {}, (capabilities) => {
+          console.log("Router RTP Capabilities:", capabilities);
+          rtpCapabilities = capabilities; // 서버의 RTP Capabilities 저장
+        });
+        // const videoTrack = stream.getVideoTracks()[0];
+
+        socket.emit("createTransport", {}, async (transportOptions) => {
+          transport = new RTCPeerConnection({
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+          });
+          transport.onicecandidate = (event) => {
+            if (event.cancelable) {
+              socket.emit(
+                "connectTransport",
+                {
+                  dtlsParameters: transport.localDescription.sdp,
+                },
+                (response) => {
+                  if (response.error) {
+                    console.error("connect transport error: ", response.error);
+                  }
+                }
+              );
+            }
+          };
+
+          const videoTrack = stream.getVideoTracks()[0];
+          transport.addTrack(videoTrack);
+          const offer = await transport.createOffer();
+          await transport.setLocalDescription(offer);
+
+          socket.emit(
+            "produce",
+            {
+              kind: "video", // "video" 또는 "audio"
+              rtpParameters: {
+                codecs: [
+                  {
+                    mimeType: "video/VP8",
+                    payloadType: 96,
+                    clockRate: 90000,
+                    parameters: {},
+                  },
+                ],
+                headerExtensions: [],
+                encodings: [
+                  { ssrc: 12345678 }, // SSRC 값을 임의로 설정
+                ],
+                rtcp: {
+                  cname: "stream123", // 임의의 cname 값
+                },
+              },
+            },
+            (response) => {
+              if (response.error) {
+                console.error("Produce error:", response.error);
+              } else {
+                console.log("Producer created:", response.id);
+                // socket.emit(
+                //   "consume",
+                //   {
+                //     producerId: response.id,
+                //     // rtpCapabilities: transport.localDescription.sdp,
+                //     rtpCapabilities,
+                //   },
+                //   (consumeResponse) => {
+                //     if (consumeResponse.error) {
+                //       console.error("Consume error:", consumeResponse.error);
+                //     } else {
+                //       const track = new MediaStreamTrack(
+                //         response.rtpParameters
+                //       );
+                //       remoteVideo.srcObject = new MediaStream([track]);
+                //     }
+                //   }
+                // );
+                socket.emit(
+                  "consume",
+                  {
+                    producerId: response.id,
+                    rtpCapabilities, // 서버에서 받은 Capabilities 사용
+                  },
+                  async (consumeResponse) => {
+                    if (consumeResponse.error) {
+                      console.error("Consume error:", consumeResponse.error);
+                    } else {
+                      console.log("Consumer created:", consumeResponse.id);
+
+                      const remoteTransport = new RTCPeerConnection({
+                        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+                      });
+
+                      remoteTransport.ontrack = (event) => {
+                        console.log("Remote stream received");
+                        remoteVideo.srcObject = event.streams[0]; // Remote video 설정
+                      };
+
+                      // SDP를 생성하기 위해 rtpParameters를 변환해야 합니다.
+                      const sdp = transformToSDP(consumeResponse.rtpParameters); // 변환 로직 필요
+
+                      const consumerOffer = new RTCSessionDescription({
+                        type: "offer",
+                        sdp,
+                      });
+
+                      await remoteTransport.setRemoteDescription(consumerOffer);
+                      const consumerAnswer =
+                        await remoteTransport.createAnswer();
+                      await remoteTransport.setLocalDescription(consumerAnswer);
+
+                      // 서버에 응답 전달
+                      socket.emit("connectTransport", {
+                        dtlsParameters: remoteTransport.localDescription,
+                      });
+                    }
+                  }
+                );
+              }
+            }
+          );
+        });
+      }
+      function transformToSDP(rtpParameters, dtlsParameters) {
+        if (
+          !dtlsParameters ||
+          !dtlsParameters.fingerprints ||
+          dtlsParameters.fingerprints.length === 0
+        ) {
+          throw new Error("Invalid or missing DTLS parameters");
+        }
+
+        // fingerprints 배열의 첫 번째 항목 사용
+        const fingerprint = dtlsParameters.fingerprints[0];
+
+        return `v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=Mediasoup
+t=0 0
+m=video 9 UDP/TLS/RTP/SAVPF 96
+c=IN IP4 0.0.0.0
+a=mid:0
+a=sendrecv
+a=rtpmap:96 VP8/90000
+a=rtcp-mux
+a=ssrc:${rtpParameters.encodings[0].ssrc} cname:stream123
+a=fingerprint:${fingerprint.algorithm} ${fingerprint.value}
+a=setup:actpass
+`;
+      }
+
+      start();
+
+      socket.on("consume", async (data) => {
+        const remoteTransport = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+
+        remoteTransport.ontrack = (event) => {
+          remoteVideo.srcObject = event.streams[0];
+        };
+
+        const offer = new RTCSessionDescription({
+          type: "offer",
+          sdp: data.rtpParameters,
+        });
+        await remoteTransport.setRemoteDescription(offer);
+        const answer = await remoteTransport.createAnswer();
+        await remoteTransport.setLocalDescription(answer);
+
+        socket.emit("connectTransport", {
+          dtlsParameters: remoteTransport.localDescription,
+        });
+      });
+    </script>
+  </body>
+</html>
